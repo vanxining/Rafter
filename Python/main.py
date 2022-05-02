@@ -16,9 +16,7 @@ import util
 
 
 LOGGER = logging.getLogger("rafter")
-
 EPOCH = datetime.fromtimestamp(0)
-LOOP: asyncio.AbstractEventLoop
 
 
 @dataclass
@@ -70,6 +68,17 @@ class Peer(object):
         except Exception:
             LOGGER.exception(f"Failed to connect to peer at {self.addr}")
             return False
+
+    async def finalize(self):
+        try:
+            if self.writer is not None and not self.writer.is_closing():
+                if not self.writer.is_closing():
+                    self.writer.close()
+                    await self.writer.wait_closed()
+
+                self.reader = self.writer = None
+        except Exception:
+            LOGGER.exception(f"Failed to close write stream for peer at {self.addr}")
 
     def is_connected(self):
         return self.reader is not None and self.writer is not None
@@ -187,6 +196,13 @@ class Node(object):
             return True, await peer.look_for_leader()
         else:
             return False, None
+
+    async def finalize(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            LOGGER.info("Finalizing all peer connections...")
+            await asyncio.gather(*(peer.finalize() for peer in self.peers), return_exceptions=True)
 
     async def leader_send_heartbeat(self):
         results = await asyncio.gather(*(peer.ping() for peer in self.peers), return_exceptions=True)
@@ -321,7 +337,7 @@ class Node(object):
         try:
             while True:
                 message = await reader.readline()
-                LOGGER.info(f"Received {message} from {addr}")
+                LOGGER.debug(f"Received {message} from {addr}")
 
                 if not message or message.startswith(b"EXIT\r\n"):
                     LOGGER.info("Bye bye")
@@ -335,24 +351,26 @@ class Node(object):
                 await writer.drain()
         except Exception:
             LOGGER.exception(f"!!!Exception occurred <peer: {addr}>!!!")
+        finally:
+            LOGGER.debug("Close the connection")
+            writer.close()
+            await writer.wait_closed()
 
-        LOGGER.debug("Close the connection")
-        writer.close()
-        await writer.wait_closed()
+
+def print_help():
+    sys.stderr.write(f"Usage: {sys.argv[0]} <port> <peer1> [<peer2> [<peer3> [...]]]\n")
 
 
 async def main():
     if len(sys.argv) < 3:
-        logging.error(f"Usage: {sys.argv[0]} <port> <peer1> [<peer2> [<peer3> [...]]]")
+        print_help()
+        asyncio.get_event_loop().stop()
         return
 
     logging.getLogger().setLevel(logging.WARNING)
     LOGGER.propagate = False
     LOGGER.handlers = util.create_logging_handlers()
     LOGGER.setLevel(logging.DEBUG)
-
-    global LOOP
-    LOOP = asyncio.get_event_loop()
 
     port, peers = sys.argv[1], sys.argv[2:]
     node = Node(f"127.0.0.1:{port}", peers)
@@ -363,7 +381,7 @@ async def main():
     LOGGER.info(f"Serving on {addrs}")
 
     async with server:
-        await asyncio.gather(node.post_initialize(), node.request_votes(), server.serve_forever())
+        await asyncio.gather(node.post_initialize(), node.finalize(), node.request_votes(), server.serve_forever())
 
 
 if __name__ == "__main__":
