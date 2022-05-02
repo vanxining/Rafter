@@ -50,7 +50,8 @@ PONG = b'{"ok":true,"result":"PONG"}'
 FAILURE = b'{"ok":false}'
 
 EPOCH = datetime.fromtimestamp(0)
-HEARDBEAT_TIMEOUT = timedelta(milliseconds=250)
+LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=250)
+FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=2)
 VOTE_TIMEOUT = timedelta(milliseconds=500)
 
 
@@ -61,10 +62,14 @@ class Peer(object):
 
         self.reader = None
         self.writer = None
+
+        self.is_first_time_initialized = False
         self.last_active_time = EPOCH
 
     async def initialize(self):
         try:
+            LOGGER.info(f"Connecting peer at {self.addr}")
+
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
             self.last_active_time = datetime.now()
 
@@ -73,6 +78,9 @@ class Peer(object):
         except Exception:
             LOGGER.exception(f"Failed to connect to peer at {self.addr}")
             return False
+        finally:
+            if not self.is_first_time_initialized:
+                self.is_first_time_initialized = True
 
     async def finalize(self):
         try:
@@ -87,6 +95,15 @@ class Peer(object):
     def is_connected(self):
         return self.reader is not None and self.writer is not None and not self.writer.is_closing()
 
+    async def ensure_connected(self):
+        if self.is_connected():
+            return True
+        elif not self.is_first_time_initialized:
+            raise RuntimeError(f"Please wait for peer at {self.addr} to be initialized for the first time!")
+        else:
+            LOGGER.info(f"Re-connecting peer at {self.addr}")
+            return await self.initialize()
+
     async def send(self, message: [bytes, str]) -> bytes:
         if isinstance(message, str):
             message = message.encode()
@@ -95,18 +112,21 @@ class Peer(object):
         self.writer.write(b"\r\n")
         await self.writer.drain()
 
-        return await self.reader.readline()
+        response = await self.reader.readline()
+        if len(response) == 0 or not response.endswith(b"\n"):
+            LOGGER.info(f"Peer at {self.addr} is disconnected")
+            self.reader = self.writer = None
+        return response
 
     async def ping(self):
         try:
-            if self.is_connected():
+            if await self.ensure_connected():
                 response = await self.send(b"PING")
                 if response.rstrip() == PONG:
                     self.last_active_time = datetime.now()
                     return True
             else:
-                LOGGER.info(f"Re-connect to peer at {self.addr}")
-                return await self.initialize()
+                LOGGER.info(f"Failed to connect to peer at {self.addr}")
         except Exception:
             LOGGER.exception(f"Failed to ping peer at {self.addr}")
 
@@ -169,6 +189,7 @@ class Node(object):
 
         self.voted_for = self.addr
         self.vote_timeout = VOTE_TIMEOUT * random.uniform(1.0, 1.2)
+        self.is_candidate = False
 
         self.leader_addr = None
 
@@ -181,7 +202,7 @@ class Node(object):
         self.peer_dict = {peer.addr: peer for peer in self.peers}
 
     async def post_initialize(self):
-        results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers), return_exceptions=True)
+        results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers))
         for index, result in enumerate(results):
             connected, leader_addr = result
             if connected is True:
@@ -206,13 +227,7 @@ class Node(object):
             await asyncio.Future()
         except asyncio.CancelledError:
             LOGGER.info("Finalizing all peer connections...")
-            await asyncio.gather(*(peer.finalize() for peer in self.peers), return_exceptions=True)
-
-    async def leader_send_heartbeat(self):
-        results = await asyncio.gather(*(peer.ping() for peer in self.peers), return_exceptions=True)
-        for index, result in enumerate(results):
-            if not result:
-                LOGGER.info(f"Can't ping peer at {self.peers[index].addr}")
+            await asyncio.gather(*(peer.finalize() for peer in self.peers))
 
     def on_look_for_leader(self) -> bytes:
         if self.leader_addr is not None:
@@ -231,6 +246,7 @@ class Node(object):
                 if delta < self.vote_timeout:
                     continue
                 else:
+                    self.leader_addr = None
                     LOGGER.info("Leader is not responding. A new election will be started")
 
             quorum = (len(self.peers) + 1) // 2 + 1
@@ -239,16 +255,19 @@ class Node(object):
                 if peer.is_connected():
                     num_connected_nodes += 1
             if num_connected_nodes < quorum:
+                LOGGER.info(f"No enough active nodes to start a election. "
+                            f"Total: {len(self.peers) + 1}, quorum: {quorum}, active: {num_connected_nodes}")
                 continue
 
             self.current_term += 1
             self.voted_for = self.addr
+            self.is_candidate = True
             LOGGER.info(f"Start election for Term {self.current_term}")
 
             rpc = RequestVote(self.current_term, self.addr, self.logs[-1].index, self.logs[-1].term)
 
             num_votes = 1
-            results = await asyncio.gather(*(peer.request_vote(rpc) for peer in self.peers), return_exceptions=True)
+            results = await asyncio.gather(*(peer.request_vote(rpc) for peer in self.peers))
             for index, result in enumerate(results):
                 LOGGER.info(f"Peer at {self.peers[index].addr} {'voted for me' if result else 'NOT vote for me'}")
                 if result:
@@ -264,7 +283,12 @@ class Node(object):
 
                 await self.append_entries()
 
+            self.is_candidate = False
+
     def on_request_vote(self, data: bytes) -> bytes:
+        if self.is_candidate:
+            return FAILURE
+
         rpc = fromdict(RequestVote, json.loads(data))
 
         if self.current_term > rpc.term:
@@ -282,12 +306,11 @@ class Node(object):
         return b'{"ok":true,"term":%d}' % rpc.term
 
     async def append_entries(self):
-        tasks = (self.append_entries_for_peer(index) for index in range(len(self.peers)))
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(self.append_entries_for_peer(index) for index in range(len(self.peers))))
 
     async def append_entries_for_peer(self, peer_index: int):
         peer = self.peers[peer_index]
-        if not peer.is_connected():
+        if not peer.is_first_time_initialized or not await peer.ensure_connected():
             return
 
         next_index = self.next_indices[peer_index]
@@ -323,6 +346,21 @@ class Node(object):
             self.logs += rpc.entries
 
         return b'{"ok":true}'
+
+    async def leader_send_heartbeat(self):
+        while True:
+            await asyncio.sleep(LEADER_HEARDBEAT_TIMEOUT.total_seconds())
+
+            if self.addr == self.leader_addr and not self.is_candidate:
+                await self.append_entries()
+
+    async def follower_send_heartbeat(self):
+        while True:
+            await asyncio.sleep(FOLLOWER_HEARDBEAT_TIMEOUT.total_seconds())
+
+            if self.addr != self.leader_addr and not self.is_candidate:
+                await asyncio.gather(*(peer.ping() for peer in self.peers
+                                       if peer.is_first_time_initialized and peer.addr != self.leader_addr))
 
     def run(self, message: bytes) -> bytes:
         if message == b"PING\r\n":
@@ -385,7 +423,12 @@ async def main():
     LOGGER.info(f"Serving on {addrs}")
 
     async with server:
-        await asyncio.gather(node.post_initialize(), node.finalize(), node.request_votes(), server.serve_forever())
+        await asyncio.gather(node.post_initialize(),
+                             node.finalize(),
+                             node.request_votes(),
+                             node.leader_send_heartbeat(),
+                             node.follower_send_heartbeat(),
+                             server.serve_forever())
 
 
 if __name__ == "__main__":
