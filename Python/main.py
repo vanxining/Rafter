@@ -7,7 +7,7 @@ import random
 import sys
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiorun import run
 from dataclass_wizard import asdict, fromdict
@@ -16,7 +16,6 @@ import util
 
 
 LOGGER = logging.getLogger("rafter")
-EPOCH = datetime.fromtimestamp(0)
 
 
 @dataclass
@@ -50,6 +49,10 @@ class AppendEntries:
 PONG = b'{"ok":true,"result":"PONG"}'
 FAILURE = b'{"ok":false}'
 
+EPOCH = datetime.fromtimestamp(0)
+HEARDBEAT_TIMEOUT = timedelta(milliseconds=250)
+VOTE_TIMEOUT = timedelta(milliseconds=500)
+
 
 class Peer(object):
     def __init__(self, addr: str):
@@ -64,6 +67,8 @@ class Peer(object):
         try:
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
             self.last_active_time = datetime.now()
+
+            LOGGER.info(f"Connected to peer at {self.addr}")
             return True
         except Exception:
             LOGGER.exception(f"Failed to connect to peer at {self.addr}")
@@ -71,17 +76,16 @@ class Peer(object):
 
     async def finalize(self):
         try:
-            if self.writer is not None and not self.writer.is_closing():
-                if not self.writer.is_closing():
-                    self.writer.close()
-                    await self.writer.wait_closed()
+            if self.is_connected():
+                self.writer.close()
+                await self.writer.wait_closed()
 
-                self.reader = self.writer = None
+            self.reader = self.writer = None
         except Exception:
             LOGGER.exception(f"Failed to close write stream for peer at {self.addr}")
 
     def is_connected(self):
-        return self.reader is not None and self.writer is not None
+        return self.reader is not None and self.writer is not None and not self.writer.is_closing()
 
     async def send(self, message: [bytes, str]) -> bytes:
         if isinstance(message, str):
@@ -95,12 +99,13 @@ class Peer(object):
 
     async def ping(self):
         try:
-            if self.reader is not None:
+            if self.is_connected():
                 response = await self.send(b"PING")
                 if response.rstrip() == PONG:
                     self.last_active_time = datetime.now()
                     return True
             else:
+                LOGGER.info(f"Re-connect to peer at {self.addr}")
                 return await self.initialize()
         except Exception:
             LOGGER.exception(f"Failed to ping peer at {self.addr}")
@@ -163,8 +168,7 @@ class Node(object):
         self.current_term = 0
 
         self.voted_for = self.addr
-        self.vote_timeout = 0.5 * random.uniform(1.0, 1.2)
-        self.voting = False
+        self.vote_timeout = VOTE_TIMEOUT * random.uniform(1.0, 1.2)
 
         self.leader_addr = None
 
@@ -174,13 +178,13 @@ class Node(object):
 
         # Cluster status
         self.peers = [Peer(addr) for addr in peers]
+        self.peer_dict = {peer.addr: peer for peer in self.peers}
 
     async def post_initialize(self):
         results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers), return_exceptions=True)
         for index, result in enumerate(results):
             connected, leader_addr = result
             if connected is True:
-                LOGGER.info(f"Connected to peer at {self.peers[index].addr}")
                 if leader_addr is not None:
                     if self.leader_addr is not None and self.leader_addr != leader_addr:
                         if self.leader_addr != leader_addr:
@@ -218,10 +222,16 @@ class Node(object):
 
     async def request_votes(self):
         while True:
-            await asyncio.sleep(self.vote_timeout)
+            await asyncio.sleep(self.vote_timeout.total_seconds())
 
             if self.leader_addr is not None:
-                continue
+                if self.leader_addr == self.addr:
+                    continue
+                delta = datetime.now() - self.peer_dict[self.leader_addr].last_active_time
+                if delta < self.vote_timeout:
+                    continue
+                else:
+                    LOGGER.info("Leader is not responding. A new election will be started")
 
             quorum = (len(self.peers) + 1) // 2 + 1
             num_connected_nodes = 1
@@ -231,9 +241,9 @@ class Node(object):
             if num_connected_nodes < quorum:
                 continue
 
-            self.voting = True
             self.current_term += 1
-            LOGGER.info(f"Start voting for new term {self.current_term}")
+            self.voted_for = self.addr
+            LOGGER.info(f"Start election for Term {self.current_term}")
 
             rpc = RequestVote(self.current_term, self.addr, self.logs[-1].index, self.logs[-1].term)
 
@@ -246,7 +256,7 @@ class Node(object):
 
             LOGGER.info(f"Cluster size: {len(self.peers) + 1}, quorum: {quorum}, votes: {num_votes}")
             if num_votes >= quorum:
-                LOGGER.info("I'm the Leader now!")
+                LOGGER.info(f"I'm the Leader in Term {self.current_term} now!")
 
                 self.leader_addr = self.addr
                 self.next_indices = [len(self.logs)] * len(self.peers)
@@ -254,13 +264,7 @@ class Node(object):
 
                 await self.append_entries()
 
-            self.voting = False
-
     def on_request_vote(self, data: bytes) -> bytes:
-        if self.voting:
-            LOGGER.info("I'm arranging an vote currently")
-            return FAILURE
-
         rpc = fromdict(RequestVote, json.loads(data))
 
         if self.current_term > rpc.term:
@@ -306,6 +310,7 @@ class Node(object):
             self.current_term = rpc.term
         if self.leader_addr != rpc.leader_addr:  # Switch to the new leader
             self.leader_addr = rpc.leader_addr
+        self.peer_dict[self.leader_addr].last_active_time = datetime.now()
 
         if self.logs[-1].index != rpc.prev_log_index:
             return FAILURE
@@ -357,13 +362,9 @@ class Node(object):
             await writer.wait_closed()
 
 
-def print_help():
-    sys.stderr.write(f"Usage: {sys.argv[0]} <port> <peer1> [<peer2> [<peer3> [...]]]\n")
-
-
 async def main():
-    if len(sys.argv) < 3:
-        print_help()
+    if (len(sys.argv) < 4) or (int(sys.argv[1]) < 0) or (int(sys.argv[1]) >= len(sys.argv) - 2):
+        sys.stderr.write(f"Usage: {sys.argv[0]} <my_addr_index> <addr1> <addr2> [<addr3> [<addr4> [...]]]\n")
         asyncio.get_event_loop().stop()
         return
 
@@ -372,10 +373,13 @@ async def main():
     LOGGER.handlers = util.create_logging_handlers()
     LOGGER.setLevel(logging.DEBUG)
 
-    port, peers = sys.argv[1], sys.argv[2:]
-    node = Node(f"127.0.0.1:{port}", peers)
+    my_index = 2 + int(sys.argv[1])
+    my_addr = sys.argv[my_index]
+    host, port = my_addr.split(":")
+    peers = sys.argv[2:my_index] + sys.argv[(my_index + 1):]
 
-    server = await asyncio.start_server(node.handle_connection, "", port)
+    node = Node(my_addr, peers)
+    server = await asyncio.start_server(node.handle_connection, host, port)
 
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
     LOGGER.info(f"Serving on {addrs}")
