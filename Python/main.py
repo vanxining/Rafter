@@ -84,7 +84,7 @@ class Peer(object):
 
     async def finalize(self):
         try:
-            if self.is_connected():
+            if self.writer is not None:
                 self.writer.close()
                 await self.writer.wait_closed()
 
@@ -93,7 +93,8 @@ class Peer(object):
             LOGGER.exception(f"Failed to close write stream for peer at {self.addr}")
 
     def is_connected(self):
-        return self.reader is not None and self.writer is not None and not self.writer.is_closing()
+        return (self.reader is not None and not self.reader.at_eof() and
+                self.writer is not None and not self.writer.is_closing())
 
     async def ensure_connected(self):
         if self.is_connected():
@@ -102,6 +103,7 @@ class Peer(object):
             raise RuntimeError(f"Please wait for peer at {self.addr} to be initialized for the first time!")
         else:
             LOGGER.info(f"Re-connecting peer at {self.addr}")
+            await self.finalize()
             return await self.initialize()
 
     async def send(self, message: [bytes, str]) -> bytes:
@@ -112,11 +114,7 @@ class Peer(object):
         self.writer.write(b"\r\n")
         await self.writer.drain()
 
-        response = await self.reader.readline()
-        if len(response) == 0 or not response.endswith(b"\n"):
-            LOGGER.info(f"Peer at {self.addr} is disconnected")
-            self.reader = self.writer = None
-        return response
+        return await self.reader.readline()
 
     async def ping(self):
         try:
@@ -274,7 +272,10 @@ class Node(object):
                     num_votes += 1
 
             LOGGER.info(f"Cluster size: {len(self.peers) + 1}, quorum: {quorum}, votes: {num_votes}")
-            if num_votes >= quorum:
+            if rpc.term != self.current_term:
+                assert rpc.term < self.current_term
+                LOGGER.info(f"Term {self.current_term} started by peer. Election aborted")
+            elif num_votes >= quorum:
                 LOGGER.info(f"I'm the Leader in Term {self.current_term} now!")
 
                 self.leader_addr = self.addr
@@ -286,19 +287,17 @@ class Node(object):
             self.is_candidate = False
 
     def on_request_vote(self, data: bytes) -> bytes:
-        if self.is_candidate:
-            return FAILURE
-
         rpc = fromdict(RequestVote, json.loads(data))
+        assert rpc.candidate_addr != self.addr
+
+        if self.logs[-1].index > rpc.last_log_index or self.logs[-1].term > rpc.last_log_term:
+            return FAILURE
 
         if self.current_term > rpc.term:
             return FAILURE
         elif self.current_term == rpc.term and self.voted_for != rpc.candidate_addr:
             return FAILURE
         self.current_term = rpc.term
-
-        if self.logs[-1].index > rpc.last_log_index or self.logs[-1].term > rpc.last_log_term:
-            return FAILURE
 
         LOGGER.info(f"Voted for {rpc.candidate_addr}")
         self.voted_for = rpc.candidate_addr
