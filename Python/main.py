@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import json
 import logging
@@ -355,7 +357,7 @@ async def main():
     port, peers = sys.argv[1], sys.argv[2:]
     node = Node(f"127.0.0.1:{port}", peers)
 
-    server = await asyncio.start_server(node.handle_connection, "127.0.0.1", port)
+    server = await asyncio.start_server(node.handle_connection, "", port)
 
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
     LOGGER.info(f"Serving on {addrs}")
