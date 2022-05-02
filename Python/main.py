@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 
+from aiorun import run
 from dataclass_wizard import asdict, fromdict
 
 import util
@@ -85,7 +86,7 @@ class Peer(object):
         try:
             if self.reader is not None:
                 response = await self.send(b"PING")
-                if response == PONG:
+                if response.rstrip() == PONG:
                     self.last_active_time = datetime.now()
                     return True
             else:
@@ -125,6 +126,20 @@ class Peer(object):
 
         return False
 
+    async def append_entries(self, rpc: AppendEntries):
+        assert self.is_connected()
+
+        try:
+            response = await self.send(f"APPEND_ENTRIES {util.dump_as_json(asdict(rpc))}")
+            if response and response.rstrip() != FAILURE:
+                obj = json.loads(response)
+                if obj.get("ok") is True:
+                    return True
+        except Exception:
+            LOGGER.exception(f"Failed to send AppendEntries RPC to peer at {self.addr}")
+
+        return False
+
 
 class Node(object):
     def __init__(self, addr: str, peers: list[str]):
@@ -150,7 +165,7 @@ class Node(object):
         self.peers = [Peer(addr) for addr in peers]
 
     async def post_initialize(self):
-        results = await asyncio.gather(*[Node.initialize_peer(peer) for peer in self.peers], return_exceptions=True)
+        results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers), return_exceptions=True)
         for index, result in enumerate(results):
             connected, leader_addr = result
             if connected is True:
@@ -172,7 +187,7 @@ class Node(object):
             return False, None
 
     async def leader_send_heartbeat(self):
-        results = await asyncio.gather(*[peer.ping() for peer in self.peers], return_exceptions=True)
+        results = await asyncio.gather(*(peer.ping() for peer in self.peers), return_exceptions=True)
         for index, result in enumerate(results):
             if not result:
                 LOGGER.info(f"Can't ping peer at {self.peers[index].addr}")
@@ -205,7 +220,7 @@ class Node(object):
             rpc = RequestVote(self.current_term, self.addr, self.logs[-1].index, self.logs[-1].term)
 
             num_votes = 1
-            results = await asyncio.gather(*[peer.request_vote(rpc) for peer in self.peers], return_exceptions=True)
+            results = await asyncio.gather(*(peer.request_vote(rpc) for peer in self.peers), return_exceptions=True)
             for index, result in enumerate(results):
                 LOGGER.info(f"Peer at {self.peers[index].addr} {'voted for me' if result else 'NOT vote for me'}")
                 if result:
@@ -245,10 +260,14 @@ class Node(object):
         return b'{"ok":true,"term":%d}' % rpc.term
 
     async def append_entries(self):
-        await asyncio.gather(
-            *[self.append_entries_for_peer(index) for index in range(len(self.peers))], return_exceptions=True)
+        tasks = (self.append_entries_for_peer(index) for index in range(len(self.peers)))
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def append_entries_for_peer(self, peer_index: int):
+        peer = self.peers[peer_index]
+        if not peer.is_connected():
+            return
+
         next_index = self.next_indices[peer_index]
         new_next_index = len(self.logs)
         previous_entry = self.logs[self.match_indices[peer_index]]
@@ -256,12 +275,9 @@ class Node(object):
         rpc = AppendEntries(self.current_term, self.addr, self.commit_index,
                             self.logs[next_index:], previous_entry.index, previous_entry.term)
 
-        response = await self.peers[peer_index].send("APPEND_ENTRIES " + util.dump_as_json(asdict(rpc)))
-        if response.rstrip() != FAILURE:
-            obj = json.loads(response)
-            if obj.get("ok") is True:
-                self.next_indices[peer_index] = new_next_index
-                self.match_indices[peer_index] = new_next_index - 1
+        if await peer.append_entries(rpc):
+            self.next_indices[peer_index] = new_next_index
+            self.match_indices[peer_index] = new_next_index - 1
 
     def on_append_entries(self, data: bytes) -> bytes:
         rpc = fromdict(AppendEntries, json.loads(data))
@@ -295,7 +311,7 @@ class Node(object):
         elif message.startswith(b"REQUEST_VOTE "):
             return self.on_request_vote(message[13:])
 
-        return f"General response from {self.addr} for unknown message `{message.rstrip()}`".encode()
+        return f"General response for unknown message `{message.rstrip()}`".encode()
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
@@ -320,6 +336,7 @@ class Node(object):
 
         LOGGER.debug("Close the connection")
         writer.close()
+        await writer.wait_closed()
 
 
 async def main():
@@ -336,9 +353,9 @@ async def main():
     LOOP = asyncio.get_event_loop()
 
     port, peers = sys.argv[1], sys.argv[2:]
-    node = Node(f"localhost:{port}", peers)
+    node = Node(f"127.0.0.1:{port}", peers)
 
-    server = await asyncio.start_server(node.handle_connection, "localhost", port)
+    server = await asyncio.start_server(node.handle_connection, "127.0.0.1", port)
 
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
     LOGGER.info(f"Serving on {addrs}")
@@ -348,4 +365,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run(main())
