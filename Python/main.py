@@ -52,6 +52,7 @@ FAILURE = b'{"ok":false}'
 FAILURE_WITH_REASON = b'{"ok":false,"reason":"%b"}'
 
 EPOCH = datetime.fromtimestamp(0)
+CONNECT_TIMEOUT = timedelta(milliseconds=50)
 LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=800)
 FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=3)
 VOTE_TIMEOUT = LEADER_HEARDBEAT_TIMEOUT * 1.5
@@ -72,13 +73,14 @@ class Peer(object):
         try:
             LOGGER.info(f"Connecting peer at {self.addr}")
 
-            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), timeout=CONNECT_TIMEOUT.total_seconds())
             self.last_active_time = datetime.now()
 
             LOGGER.info(f"Connected to peer at {self.addr}")
             return True
         except Exception:
-            LOGGER.exception(f"Failed to connect to peer at {self.addr}")
+            LOGGER.warning(f"Failed to connect to peer at {self.addr}")
             return False
         finally:
             if not self.is_first_time_initialized:
@@ -125,8 +127,6 @@ class Peer(object):
                 if response.rstrip() == PONG:
                     self.last_active_time = datetime.now()
                     return True
-            else:
-                LOGGER.info(f"Failed to connect to peer at {self.addr}")
         except Exception:
             LOGGER.exception(f"Failed to ping peer at {self.addr}")
 
@@ -244,8 +244,11 @@ class Node(object):
             if index > 0 and count[index] >= peer_quorum:
                 assert self.commit_index <= index
                 if self.commit_index < index:
-                    self.commit_index = index
-                    LOGGER.info(f"Commit index updated to {index}")
+                    if self.logs[index].term == self.current_term:
+                        self.commit_index = index
+                        LOGGER.info(f"Commit index updated to {index}")
+                    else:
+                        LOGGER.info(f"Skipped to commmit Log {index} because it was not produced in my term")
                 break
 
     def on_look_for_leader(self, data: bytes) -> bytes:
