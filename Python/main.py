@@ -6,6 +6,7 @@ import logging
 import random
 import sys
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -51,8 +52,8 @@ FAILURE = b'{"ok":false}'
 FAILURE_WITH_REASON = b'{"ok":false,"reason":"%b"}'
 
 EPOCH = datetime.fromtimestamp(0)
-LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=250)
-FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=2)
+LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=800)
+FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=3)
 VOTE_TIMEOUT = LEADER_HEARDBEAT_TIMEOUT * 1.5
 
 
@@ -161,19 +162,23 @@ class Peer(object):
 
         return False
 
-    async def append_entries(self, rpc: AppendEntries):
+    async def append_entries(self, rpc: AppendEntries) -> [bool, None]:
         assert self.is_connected()
 
         try:
             response = await self.send(f"APPEND_ENTRIES {util.dump_as_json(asdict(rpc))}")
-            if response and response.rstrip() != FAILURE:
-                obj = json.loads(response)
-                if obj.get("ok") is True:
-                    return True
+            if response:
+                if response.rstrip() != FAILURE:
+                    obj = json.loads(response)
+                    if obj.get("ok") is True:
+                        return True
+                else:
+                    return False
+            LOGGER.exception(f"Unexpected AppendEntries RPC response from peer at {self.addr} -- {response}")
         except Exception:
             LOGGER.exception(f"Failed to send AppendEntries RPC to peer at {self.addr}")
 
-        return False
+        return None
 
 
 class Node(object):
@@ -227,6 +232,22 @@ class Node(object):
             LOGGER.info("Finalizing all peer connections...")
             await asyncio.gather(*(peer.finalize() for peer in self.peers))
 
+    def get_quorum(self):
+        return (len(self.peers) + 1) // 2 + 1
+
+    def update_commit_index(self):
+        peer_quorum = self.get_quorum() - 1
+        count = defaultdict(int)
+
+        for index in self.match_indices:
+            count[index] += 1
+            if index > 0 and count[index] >= peer_quorum:
+                assert self.commit_index <= index
+                if self.commit_index < index:
+                    self.commit_index = index
+                    LOGGER.info(f"Commit index updated to {index}")
+                break
+
     def on_look_for_leader(self, data: bytes) -> bytes:
         obj = json.loads(data)
         if obj.get("my_addr") not in self.peer_dict:
@@ -251,7 +272,7 @@ class Node(object):
                     self.leader_addr = None
                     LOGGER.info("Leader is not responding. A new election will be started")
 
-            quorum = (len(self.peers) + 1) // 2 + 1
+            quorum = self.get_quorum()
             num_connected_nodes = 1
             for peer in self.peers:
                 if peer.is_connected():
@@ -284,7 +305,7 @@ class Node(object):
 
                 self.leader_addr = self.addr
                 self.next_indices = [len(self.logs)] * len(self.peers)
-                self.match_indices = [len(self.logs) - 1] * len(self.peers)
+                self.match_indices = [0] * len(self.peers)
 
                 await self.append_entries()
 
@@ -310,6 +331,7 @@ class Node(object):
 
     async def append_entries(self):
         await asyncio.gather(*(self.append_entries_for_peer(index) for index in range(len(self.peers))))
+        self.update_commit_index()
 
     async def append_entries_for_peer(self, peer_index: int):
         peer = self.peers[peer_index]
@@ -317,15 +339,23 @@ class Node(object):
             return
 
         next_index = self.next_indices[peer_index]
-        new_next_index = len(self.logs)
-        previous_entry = self.logs[self.match_indices[peer_index]]
+        new_next_index = min(next_index + 5, len(self.logs))
+        previous_entry = self.logs[next_index - 1]
 
         rpc = AppendEntries(self.current_term, self.addr, self.commit_index,
-                            self.logs[next_index:], previous_entry.index, previous_entry.term)
+                            self.logs[next_index:new_next_index].copy(),
+                            previous_entry.index, previous_entry.term)
 
-        if await peer.append_entries(rpc):
+        result = await peer.append_entries(rpc)
+        if result is True:
             self.next_indices[peer_index] = new_next_index
             self.match_indices[peer_index] = new_next_index - 1
+        elif result is False:
+            if next_index > 1:
+                self.next_indices[peer_index] = next_index - 1
+                self.match_indices[peer_index] = 0
+            else:
+                raise RuntimeError("Unexpected condition: dummy logs not align")
 
     def on_append_entries(self, data: bytes) -> bytes:
         rpc = fromdict(AppendEntries, json.loads(data))
@@ -338,15 +368,28 @@ class Node(object):
             self.leader_addr = rpc.leader_addr
         self.peer_dict[self.leader_addr].last_active_time = datetime.now()
 
-        if self.logs[-1].index != rpc.prev_log_index:
+        if self.logs[-1].term != rpc.prev_log_term:
+            if len(self.logs) > 1:  # Not the dummy log case
+                self.logs = self.logs[:-1]
             return FAILURE
 
-        if self.logs[-1].term != rpc.term and len(self.logs) > 1:
-            self.logs = self.logs[:-1]
+        if self.logs[-1].index != rpc.prev_log_index:
+            if self.logs[-1].index > rpc.prev_log_index:
+                raise RuntimeError("Different logs of the same slot in the same term")
             return FAILURE
 
         if len(rpc.entries) > 0:
             self.logs += rpc.entries
+        self.commit_index = min(len(self.logs) - 1, rpc.leader_commit_index)
+
+        return b'{"ok":true}'
+
+    def on_mod(self) -> bytes:
+        if self.addr != self.leader_addr:
+            LOGGER.error("Not the Leader but received a MOD message")
+            return FAILURE
+
+        self.logs.append(Log(len(self.logs), self.current_term))
 
         return b'{"ok":true}'
 
@@ -370,12 +413,14 @@ class Node(object):
             return PONG
         elif message.startswith(b"APPEND_ENTRIES "):
             return self.on_append_entries(message[15:])
+        elif message.startswith(b"MOD\r\n"):
+            return self.on_mod()
         elif message.startswith(b"LOOK_FOR_LEADER "):
             return self.on_look_for_leader(message[16:])
         elif message.startswith(b"REQUEST_VOTE "):
             return self.on_request_vote(message[13:])
 
-        return f"General response for unknown message `{message.rstrip()}`".encode()
+        return f"General response for unknown message {message.rstrip()}".encode()
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
