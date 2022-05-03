@@ -31,6 +31,7 @@ class RequestVote:
 class Log:
     index: int
     term: int
+    command: str
 
 
 @dataclass
@@ -185,7 +186,7 @@ class Node(object):
     def __init__(self, addr: str, peers: list[str]):
         self.addr = addr
 
-        self.logs = [Log(0, 0)]
+        self.logs = [Log(0, 0, "")]
         self.commit_index = 0
         self.last_applied = 0
 
@@ -196,6 +197,7 @@ class Node(object):
         self.is_candidate = False
 
         self.leader_addr = None
+        self.leader_last_active_time = EPOCH
 
         # Only for Leader
         self.next_indices = []
@@ -232,6 +234,10 @@ class Node(object):
             LOGGER.info("Finalizing all peer connections...")
             await asyncio.gather(*(peer.finalize() for peer in self.peers))
 
+    @property
+    def is_leader(self):
+        return self.addr == self.leader_addr
+
     def get_quorum(self):
         return (len(self.peers) + 1) // 2 + 1
 
@@ -266,9 +272,9 @@ class Node(object):
             await asyncio.sleep(self.vote_timeout.total_seconds())
 
             if self.leader_addr is not None:
-                if self.leader_addr == self.addr:
+                if self.is_leader:
                     continue
-                delta = datetime.now() - self.peer_dict[self.leader_addr].last_active_time
+                delta = datetime.now() - self.leader_last_active_time
                 if delta < self.vote_timeout:
                     continue
                 else:
@@ -369,7 +375,7 @@ class Node(object):
             self.current_term = rpc.term
         if self.leader_addr != rpc.leader_addr:  # Switch to the new leader
             self.leader_addr = rpc.leader_addr
-        self.peer_dict[self.leader_addr].last_active_time = datetime.now()
+        self.leader_last_active_time = datetime.now()
 
         if self.logs[-1].term != rpc.prev_log_term:
             if len(self.logs) > 1:  # Not the dummy log case
@@ -387,12 +393,30 @@ class Node(object):
 
         return b'{"ok":true}'
 
+    def on_peer_change(self, command: str):
+        if command.startswith("ADD_PEER "):
+            addr = command[9:]
+            if addr not in self.peer_dict:
+                self.peers.append(Peer(addr))
+                self.peer_dict[addr] = self.peers[-1]
+                if self.is_leader:
+                    self.next_indices.append(len(self.logs))
+                    self.match_indices.append(0)
+        elif command.startswith("REMOVE_PEER "):
+            peer: Peer = self.peer_dict.pop(command[12:], None)
+            if peer is not None:
+                index = self.peers.index(peer)
+                del self.peers[index]
+                if self.is_leader:
+                    del self.next_indices[index]
+                    del self.match_indices[index]
+
     def on_mod(self) -> bytes:
-        if self.addr != self.leader_addr:
+        if not self.is_leader:
             LOGGER.error("Not the Leader but received a MOD message")
             return FAILURE
 
-        self.logs.append(Log(len(self.logs), self.current_term))
+        self.logs.append(Log(len(self.logs), self.current_term, ""))
 
         return b'{"ok":true}'
 
@@ -400,14 +424,14 @@ class Node(object):
         while True:
             await asyncio.sleep(LEADER_HEARDBEAT_TIMEOUT.total_seconds())
 
-            if self.addr == self.leader_addr and not self.is_candidate:
+            if self.is_leader and not self.is_candidate:
                 await self.append_entries()
 
     async def follower_send_heartbeat(self):
         while True:
             await asyncio.sleep(FOLLOWER_HEARDBEAT_TIMEOUT.total_seconds())
 
-            if self.addr != self.leader_addr and not self.is_candidate:
+            if not self.is_leader and not self.is_candidate:
                 await asyncio.gather(*(peer.ping() for peer in self.peers
                                        if peer.is_first_time_initialized and peer.addr != self.leader_addr))
 
