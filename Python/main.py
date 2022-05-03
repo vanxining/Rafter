@@ -48,11 +48,12 @@ class AppendEntries:
 
 PONG = b'{"ok":true,"result":"PONG"}'
 FAILURE = b'{"ok":false}'
+FAILURE_WITH_REASON = b'{"ok":false,"reason":"%b"}'
 
 EPOCH = datetime.fromtimestamp(0)
 LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=250)
 FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=2)
-VOTE_TIMEOUT = timedelta(milliseconds=500)
+VOTE_TIMEOUT = LEADER_HEARDBEAT_TIMEOUT * 1.5
 
 
 class Peer(object):
@@ -130,16 +131,16 @@ class Peer(object):
 
         return False
 
-    async def look_for_leader(self):
+    async def look_for_leader(self, my_addr: str):
         if not self.is_connected():
             return None
 
         try:
-            response = await self.send(b"LOOK_FOR_LEADER")
+            response = await self.send(b'LOOK_FOR_LEADER {"my_addr":"%b"}' % my_addr.encode())
             if response and response.rstrip() != FAILURE:
                 obj = json.loads(response)
                 if obj.get("ok") is True:
-                    return obj.get("value")
+                    return obj.get("leader_addr")
         except Exception:
             LOGGER.exception(f"Failed to query peer at {self.addr} for Leader")
 
@@ -200,7 +201,7 @@ class Node(object):
         self.peer_dict = {peer.addr: peer for peer in self.peers}
 
     async def post_initialize(self):
-        results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers))
+        results = await asyncio.gather(*(self.initialize_peer(peer) for peer in self.peers))
         for index, result in enumerate(results):
             connected, leader_addr = result
             if connected is True:
@@ -212,11 +213,10 @@ class Node(object):
                         LOGGER.info(f"Get Leader at {leader_addr}")
                     self.leader_addr = leader_addr
 
-    @staticmethod
-    async def initialize_peer(peer: Peer):
+    async def initialize_peer(self, peer: Peer):
         result = await peer.initialize()
         if result is True:
-            return True, await peer.look_for_leader()
+            return True, await peer.look_for_leader(self.addr)
         else:
             return False, None
 
@@ -227,9 +227,13 @@ class Node(object):
             LOGGER.info("Finalizing all peer connections...")
             await asyncio.gather(*(peer.finalize() for peer in self.peers))
 
-    def on_look_for_leader(self) -> bytes:
+    def on_look_for_leader(self, data: bytes) -> bytes:
+        obj = json.loads(data)
+        if obj.get("my_addr") not in self.peer_dict:
+            return FAILURE_WITH_REASON % b"not in peer list"
+
         if self.leader_addr is not None:
-            return b'{"ok":true,"value":"%s"}' % self.leader_addr.encode()
+            return b'{"ok":true,"leader_addr":"%s"}' % self.leader_addr.encode()
         else:
             return FAILURE
 
@@ -366,8 +370,8 @@ class Node(object):
             return PONG
         elif message.startswith(b"APPEND_ENTRIES "):
             return self.on_append_entries(message[15:])
-        elif message == b"LOOK_FOR_LEADER\r\n":
-            return self.on_look_for_leader()
+        elif message.startswith(b"LOOK_FOR_LEADER "):
+            return self.on_look_for_leader(message[16:])
         elif message.startswith(b"REQUEST_VOTE "):
             return self.on_request_vote(message[13:])
 
