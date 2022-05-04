@@ -199,7 +199,7 @@ class Node(object):
         self.current_term = 0
 
         self.voted_for = self.addr
-        self.vote_timeout = VOTE_TIMEOUT * random.uniform(1.0, 1.2)
+        self.vote_timeout = VOTE_TIMEOUT * random.uniform(1.0, 1.1)
         self.is_candidate = False
 
         self.leader_addr = None
@@ -244,6 +244,11 @@ class Node(object):
     def is_leader(self):
         return self.addr == self.leader_addr
 
+    @property
+    def is_leader_active(self):
+        delta = datetime.now() - self.leader_last_active_time
+        return delta < self.vote_timeout
+
     def get_quorum(self):
         return (len(self.peers) + 1) // 2 + 1
 
@@ -277,8 +282,7 @@ class Node(object):
             if self.leader_addr is not None:
                 if self.is_leader:
                     continue
-                delta = datetime.now() - self.leader_last_active_time
-                if delta < self.vote_timeout:
+                if self.is_leader_active:
                     continue
                 else:
                     self.leader_addr = None
@@ -326,6 +330,13 @@ class Node(object):
             self.is_candidate = False
 
     def on_request_vote(self, data: bytes) -> bytes:
+        if self.is_leader:
+            LOGGER.warning("I'm the Leader now and will only vote for myself")
+            return FAILURE
+        if self.is_leader_active:
+            LOGGER.warning("Leader is active IMO. No vote for now")
+            return FAILURE
+
         rpc = fromdict(RequestVote, json.loads(data))
         assert rpc.candidate_addr != self.addr
 
@@ -409,6 +420,10 @@ class Node(object):
     def leader_on_peer_change(self, command: str) -> bytes:
         if not self.is_leader:
             LOGGER.error(f"Not the Leader but received a {command[:command.index(' ')]} message")
+            return FAILURE
+
+        if command.startswith("REMOVE_PEER ") and len(self.peers) == 1:
+            LOGGER.error("The cluster needs at least two nodes")
             return FAILURE
 
         self.logs.append(Log(len(self.logs), self.current_term, command))
