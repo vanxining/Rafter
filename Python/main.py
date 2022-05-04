@@ -49,14 +49,20 @@ class AppendEntries:
 
 
 PONG = b'{"ok":true,"result":"PONG"}'
+OK = b'{"ok":true}'
 FAILURE = b'{"ok":false}'
 FAILURE_WITH_REASON = b'{"ok":false,"reason":"%b"}'
+NOOP = ""
 
 EPOCH = datetime.fromtimestamp(0)
 CONNECT_TIMEOUT = timedelta(milliseconds=50)
 LEADER_HEARDBEAT_TIMEOUT = timedelta(milliseconds=800)
 FOLLOWER_HEARDBEAT_TIMEOUT = timedelta(seconds=3)
 VOTE_TIMEOUT = LEADER_HEARDBEAT_TIMEOUT * 1.5
+
+
+def is_peer_change_command(command: str):
+    return command.startswith("ADD_PEER ") or command.startswith("REMOVE_PEER ")
 
 
 class Peer(object):
@@ -133,12 +139,12 @@ class Peer(object):
 
         return False
 
-    async def look_for_leader(self, my_addr: str):
+    async def look_for_leader(self):
         if not self.is_connected():
             return None
 
         try:
-            response = await self.send(b'LOOK_FOR_LEADER {"my_addr":"%b"}' % my_addr.encode())
+            response = await self.send(b'LOOK_FOR_LEADER')
             if response and response.rstrip() != FAILURE:
                 obj = json.loads(response)
                 if obj.get("ok") is True:
@@ -186,7 +192,7 @@ class Node(object):
     def __init__(self, addr: str, peers: list[str]):
         self.addr = addr
 
-        self.logs = [Log(0, 0, "")]
+        self.logs = [Log(0, 0, NOOP)]
         self.commit_index = 0
         self.last_applied = 0
 
@@ -205,10 +211,9 @@ class Node(object):
 
         # Cluster status
         self.peers = [Peer(addr) for addr in peers]
-        self.peer_dict = {peer.addr: peer for peer in self.peers}
 
     async def post_initialize(self):
-        results = await asyncio.gather(*(self.initialize_peer(peer) for peer in self.peers))
+        results = await asyncio.gather(*(Node.initialize_peer(peer) for peer in self.peers))
         for index, result in enumerate(results):
             connected, leader_addr = result
             if connected is True:
@@ -220,10 +225,11 @@ class Node(object):
                         LOGGER.info(f"Get Leader at {leader_addr}")
                     self.leader_addr = leader_addr
 
-    async def initialize_peer(self, peer: Peer):
+    @staticmethod
+    async def initialize_peer(peer: Peer):
         result = await peer.initialize()
         if result is True:
-            return True, await peer.look_for_leader(self.addr)
+            return True, await peer.look_for_leader()
         else:
             return False, None
 
@@ -251,17 +257,14 @@ class Node(object):
                 assert self.commit_index <= index
                 if self.commit_index < index:
                     if self.logs[index].term == self.current_term:
+                        self.apply_peer_changes(self.commit_index + 1, index + 1)
                         self.commit_index = index
                         LOGGER.info(f"Commit index updated to {index}")
                     else:
                         LOGGER.info(f"Skipped to commmit Log {index} because it was not produced in my term")
                 break
 
-    def on_look_for_leader(self, data: bytes) -> bytes:
-        obj = json.loads(data)
-        if obj.get("my_addr") not in self.peer_dict:
-            return FAILURE_WITH_REASON % b"not in peer list"
-
+    def on_look_for_leader(self) -> bytes:
         if self.leader_addr is not None:
             return b'{"ok":true,"leader_addr":"%s"}' % self.leader_addr.encode()
         else:
@@ -281,14 +284,16 @@ class Node(object):
                     self.leader_addr = None
                     LOGGER.info("Leader is not responding. A new election will be started")
 
+            peers = self.peers.copy()
             quorum = self.get_quorum()
+
             num_connected_nodes = 1
-            for peer in self.peers:
+            for peer in peers:
                 if peer.is_connected():
                     num_connected_nodes += 1
             if num_connected_nodes < quorum:
                 LOGGER.info(f"No enough active nodes to start a election. "
-                            f"Total: {len(self.peers) + 1}, quorum: {quorum}, active: {num_connected_nodes}")
+                            f"Total: {len(peers) + 1}, quorum: {quorum}, active: {num_connected_nodes}")
                 continue
 
             self.current_term += 1
@@ -299,13 +304,13 @@ class Node(object):
             rpc = RequestVote(self.current_term, self.addr, self.logs[-1].index, self.logs[-1].term)
 
             num_votes = 1
-            results = await asyncio.gather(*(peer.request_vote(rpc) for peer in self.peers))
+            results = await asyncio.gather(*(peer.request_vote(rpc) for peer in peers))
             for index, result in enumerate(results):
-                LOGGER.info(f"Peer at {self.peers[index].addr} {'voted for me' if result else 'NOT vote for me'}")
+                LOGGER.info(f"Peer at {peers[index].addr} {'voted for me' if result else 'NOT vote for me'}")
                 if result:
                     num_votes += 1
 
-            LOGGER.info(f"Cluster size: {len(self.peers) + 1}, quorum: {quorum}, votes: {num_votes}")
+            LOGGER.info(f"Cluster size: {len(peers) + 1}, quorum: {quorum}, votes: {num_votes}")
             if rpc.term != self.current_term:
                 assert rpc.term < self.current_term
                 LOGGER.info(f"Term {self.current_term} started by peer. Election aborted")
@@ -313,8 +318,8 @@ class Node(object):
                 LOGGER.info(f"I'm the Leader in Term {self.current_term} now!")
 
                 self.leader_addr = self.addr
-                self.next_indices = [len(self.logs)] * len(self.peers)
-                self.match_indices = [0] * len(self.peers)
+                self.next_indices = [len(self.logs)] * len(peers)
+                self.match_indices = [0] * len(peers)
 
                 await self.append_entries()
 
@@ -340,7 +345,7 @@ class Node(object):
 
     async def append_entries(self):
         await asyncio.gather(*(self.append_entries_for_peer(index) for index in range(len(self.peers))))
-        self.update_commit_index()
+        self.update_commit_index()  # Caution: cluster size change
 
     async def append_entries_for_peer(self, peer_index: int):
         peer = self.peers[peer_index]
@@ -389,36 +394,85 @@ class Node(object):
 
         if len(rpc.entries) > 0:
             self.logs += rpc.entries
+        last_commit_index = self.commit_index
         self.commit_index = min(len(self.logs) - 1, rpc.leader_commit_index)
 
-        return b'{"ok":true}'
+        self.apply_peer_changes(last_commit_index + 1, self.commit_index + 1)
+
+        return OK
+
+    def apply_peer_changes(self, begin, end):
+        for i in range(begin, end):
+            if is_peer_change_command(self.logs[i].command):
+                self.on_peer_change(self.logs[i].command)
+
+    def leader_on_peer_change(self, command: str) -> bytes:
+        if not self.is_leader:
+            LOGGER.error(f"Not the Leader but received a {command[:command.index(' ')]} message")
+            return FAILURE
+
+        self.logs.append(Log(len(self.logs), self.current_term, command))
+
+        return OK
+
+    @staticmethod
+    async def leader_notify_removed_peer(peer: Peer):
+        try:
+            if peer.is_connected():
+                await peer.send("LEAVE_CLUSTER")
+        except Exception:
+            LOGGER.exception(f"Failed to notify peer at {peer.addr} to leave the cluster")
+        finally:
+            await peer.finalize()
 
     def on_peer_change(self, command: str):
+        addr = command[(command.index(" ") + 1):]
+
+        found = False
+        index = -1
+        for index, peer in enumerate(self.peers):
+            if peer.addr == addr:
+                found = True
+                break
+
         if command.startswith("ADD_PEER "):
-            addr = command[9:]
-            if addr not in self.peer_dict:
-                self.peers.append(Peer(addr))
-                self.peer_dict[addr] = self.peers[-1]
-                if self.is_leader:
-                    self.next_indices.append(len(self.logs))
-                    self.match_indices.append(0)
+            if found or self.addr == addr:
+                return
+
+            peer = Peer(addr)
+            peer.is_first_time_initialized = True  # Hack
+            self.peers.append(peer)
+
+            if self.is_leader:
+                self.next_indices.append(len(self.logs))
+                self.match_indices.append(0)
         elif command.startswith("REMOVE_PEER "):
-            peer: Peer = self.peer_dict.pop(command[12:], None)
-            if peer is not None:
-                index = self.peers.index(peer)
-                del self.peers[index]
-                if self.is_leader:
-                    del self.next_indices[index]
-                    del self.match_indices[index]
+            loop = asyncio.get_event_loop()
+
+            if self.addr == addr:
+                loop.stop()
+                LOGGER.info("Leave the cluster by myself")
+                return
+
+            if not found:
+                return
+
+            peer = self.peers.pop(index)
+            if self.is_leader:
+                loop.call_soon(lambda: asyncio.ensure_future(Node.leader_notify_removed_peer(peer)))
+                del self.next_indices[index]
+                del self.match_indices[index]
+            else:
+                loop.call_soon(lambda: asyncio.ensure_future(peer.finalize()))
 
     def on_mod(self) -> bytes:
         if not self.is_leader:
             LOGGER.error("Not the Leader but received a MOD message")
             return FAILURE
 
-        self.logs.append(Log(len(self.logs), self.current_term, ""))
+        self.logs.append(Log(len(self.logs), self.current_term, NOOP))
 
-        return b'{"ok":true}'
+        return OK
 
     async def leader_send_heartbeat(self):
         while True:
@@ -442,10 +496,18 @@ class Node(object):
             return self.on_append_entries(message[15:])
         elif message.startswith(b"MOD\r\n"):
             return self.on_mod()
-        elif message.startswith(b"LOOK_FOR_LEADER "):
-            return self.on_look_for_leader(message[16:])
         elif message.startswith(b"REQUEST_VOTE "):
             return self.on_request_vote(message[13:])
+        elif message == b"LOOK_FOR_LEADER\r\n":
+            return self.on_look_for_leader()
+        elif message == b"LEAVE_CLUSTER\r\n":
+            loop = asyncio.get_event_loop()
+            loop.call_soon(loop.stop)
+            return OK
+        else:
+            decoded = message.decode().rstrip()
+            if is_peer_change_command(decoded):
+                return self.leader_on_peer_change(decoded)
 
         return f"General response for unknown message {message.rstrip()}".encode()
 
